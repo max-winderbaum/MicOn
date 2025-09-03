@@ -6,6 +6,14 @@ struct ContentView: View {
     @State private var isHovering = false
     @State private var showDeviceMenu = false
     
+    private var preferredDeviceName: String {
+        if let preferredID = appState.preferredDeviceID,
+           let device = appState.availableDevices.first(where: { $0.uniqueID == preferredID }) {
+            return device.localizedName
+        }
+        return "Select Device"
+    }
+    
     var body: some View {
         ZStack {
             // Background gradient
@@ -125,10 +133,19 @@ struct ContentView: View {
                                 HStack(spacing: 8) {
                                     Image(systemName: "waveform")
                                         .font(.system(size: 13))
-                                    Text(appState.selectedDevice?.localizedName ?? "Select Device")
-                                        .font(.system(size: 13, weight: .regular, design: .default))
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(preferredDeviceName)
+                                            .font(.system(size: 13, weight: .regular, design: .default))
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        
+                                        if appState.currentlyUsingFallback {
+                                            Text("Using: \(appState.selectedDevice?.localizedName ?? "Unknown")")
+                                                .font(.system(size: 10, weight: .regular))
+                                                .foregroundColor(.orange.opacity(0.8))
+                                                .lineLimit(1)
+                                        }
+                                    }
                                     Image(systemName: showDeviceMenu ? "chevron.up" : "chevron.down")
                                         .font(.system(size: 9, weight: .semibold))
                                 }
@@ -155,21 +172,33 @@ struct ContentView: View {
                                     VStack(spacing: 0) {
                                         ForEach(appState.availableDevices, id: \.uniqueID) { device in
                                             Button(action: {
-                                                appState.selectedDevice = device
+                                                appState.setPreferredDevice(device)
                                                 showDeviceMenu = false
-                                                if appState.isMicrophoneActive {
-                                                    appState.stopMicrophone()
-                                                    appState.startMicrophone()
-                                                }
                                             }) {
                                                 HStack {
-                                                    Text(device.localizedName)
-                                                        .font(.system(size: 12, weight: .regular))
-                                                        .lineLimit(1)
+                                                    VStack(alignment: .leading, spacing: 2) {
+                                                        Text(device.localizedName)
+                                                            .font(.system(size: 12, weight: .regular))
+                                                            .lineLimit(1)
+                                                        
+                                                        if device.uniqueID == appState.preferredDeviceID {
+                                                            Text("Preferred Device")
+                                                                .font(.system(size: 10, weight: .medium))
+                                                                .foregroundColor(.green.opacity(0.8))
+                                                        }
+                                                    }
                                                     Spacer()
-                                                    if device == appState.selectedDevice {
-                                                        Image(systemName: "checkmark")
-                                                            .font(.system(size: 10))
+                                                    HStack(spacing: 6) {
+                                                        if device.uniqueID == appState.preferredDeviceID {
+                                                            Image(systemName: "heart.fill")
+                                                                .font(.system(size: 9))
+                                                                .foregroundColor(.green)
+                                                        }
+                                                        if device == appState.selectedDevice {
+                                                            Image(systemName: "checkmark")
+                                                                .font(.system(size: 10))
+                                                                .foregroundColor(.blue)
+                                                        }
                                                     }
                                                 }
                                                 .padding(.horizontal, 12)

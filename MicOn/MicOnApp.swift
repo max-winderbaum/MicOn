@@ -7,7 +7,8 @@ struct MicOnApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
     var body: some Scene {
-        WindowGroup {
+        // No window group - app runs entirely from menu bar
+        Settings {
             EmptyView()
         }
     }
@@ -107,20 +108,32 @@ class AppState: ObservableObject {
     @Published var selectedDevice: AVCaptureDevice?
     @Published var availableDevices: [AVCaptureDevice] = []
     
+    // Persistent device preference
+    @Published var preferredDeviceID: String?
+    @Published var currentlyUsingFallback = false
+    
     private var audioEngine: AVAudioEngine?
     private var inputNode: AVAudioInputNode?
     private var captureSession: AVCaptureSession?
     private var mixerNode: AVAudioMixerNode?
+    private var pollingTimer: Timer?
+    private var lastSuccessfulDevice: AVCaptureDevice?
+    private var audioLevelMonitor: AVAudioPlayerNode?
+    private var hasRecentAudioInput = false
+    private var lastAudioInputTime: Date?
     
     init() {
+        loadPreferredDevice()
         refreshDevices()
         requestMicrophonePermission()
+        setupDeviceChangeNotifications()
         
         // Start with microphone on by default after permissions are granted
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             // Only start if we have permission
             if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
                 self?.startMicrophone()
+                self?.startPollingTimer()
             }
         }
     }
@@ -133,8 +146,125 @@ class AppState: ObservableObject {
         )
         availableDevices = discoverySession.devices
         
-        if selectedDevice == nil, let first = availableDevices.first {
+        // Try to restore preferred device if available
+        if let preferredID = preferredDeviceID,
+           let preferredDevice = availableDevices.first(where: { $0.uniqueID == preferredID }) {
+            selectedDevice = preferredDevice
+        } else if selectedDevice == nil, let first = availableDevices.first {
             selectedDevice = first
+            
+            // Auto-select first device as preferred on initial startup
+            if preferredDeviceID == nil {
+                setDefaultPreferredDevice()
+            }
+        }
+    }
+    
+    private func setDefaultPreferredDevice() {
+        // Prefer external devices (Bluetooth) over built-in microphone
+        let preferredDevice = availableDevices.first { $0.deviceType == .externalUnknown } 
+                           ?? availableDevices.first { $0.deviceType == .builtInMicrophone }
+                           ?? availableDevices.first
+        
+        if let device = preferredDevice {
+            print("Auto-selecting default preferred device: \(device.localizedName)")
+            setPreferredDevice(device)
+        }
+    }
+    
+    // MARK: - Device Preference Management
+    
+    private func loadPreferredDevice() {
+        preferredDeviceID = UserDefaults.standard.string(forKey: "MicOnPreferredDeviceID")
+        print("Loaded preferred device ID: \(preferredDeviceID ?? "none")")
+    }
+    
+    private func savePreferredDevice(_ deviceID: String) {
+        preferredDeviceID = deviceID
+        UserDefaults.standard.set(deviceID, forKey: "MicOnPreferredDeviceID")
+        print("Saved preferred device ID: \(deviceID)")
+    }
+    
+    func setPreferredDevice(_ device: AVCaptureDevice) {
+        selectedDevice = device
+        savePreferredDevice(device.uniqueID)
+        currentlyUsingFallback = false
+        
+        // If microphone is active, restart with the new preferred device
+        if isMicrophoneActive {
+            print("Switching to new preferred device: \(device.localizedName)")
+            attemptReconnection()
+        }
+    }
+    
+    private func getPreferredDevice() -> AVCaptureDevice? {
+        guard let preferredID = preferredDeviceID else { return nil }
+        return availableDevices.first { $0.uniqueID == preferredID }
+    }
+    
+    private func setupDeviceChangeNotifications() {
+        // Listen for device connection/disconnection events
+        NotificationCenter.default.addObserver(
+            forName: .AVCaptureDeviceWasConnected,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            if let device = notification.object as? AVCaptureDevice,
+               device.hasMediaType(.audio) {
+                print("Audio device connected: \(device.localizedName)")
+                self?.refreshDevices()
+                
+                // Check if this is our preferred device coming back online
+                if let preferredID = self?.preferredDeviceID,
+                   device.uniqueID == preferredID {
+                    print("🎯 Preferred device reconnected! Switching back to: \(device.localizedName)")
+                    self?.currentlyUsingFallback = false
+                    
+                    // Switch back to preferred device immediately
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        self?.attemptReconnection()
+                    }
+                } else if self?.isMicrophoneActive == true && self?.isMicrophoneReallyActive() == false {
+                    // General reconnection attempt if we're supposed to be active but aren't
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        self?.attemptReconnection()
+                    }
+                }
+            }
+        }
+        
+        NotificationCenter.default.addObserver(
+            forName: .AVCaptureDeviceWasDisconnected,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            if let device = notification.object as? AVCaptureDevice,
+               device.hasMediaType(.audio) {
+                print("Audio device disconnected: \(device.localizedName)")
+                self?.refreshDevices()
+                
+                // Check if this was our preferred device
+                if let preferredID = self?.preferredDeviceID,
+                   device.uniqueID == preferredID {
+                    print("⚠️ Preferred device disconnected: \(device.localizedName)")
+                    self?.currentlyUsingFallback = true
+                    
+                    // Try to fall back to another device temporarily
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        if self?.isMicrophoneActive == true {
+                            self?.attemptReconnection()
+                        }
+                    }
+                } else if device.uniqueID == self?.selectedDevice?.uniqueID {
+                    print("Currently used device was disconnected!")
+                    // Give it a moment for potential reconnection, then check state
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        if self?.isMicrophoneActive == true {
+                            self?.checkMicrophoneState()
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -202,6 +332,238 @@ class AppState: ObservableObject {
         }
         
         print("Permission is authorized, starting microphone...")
+        startMicrophoneInternal()
+    }
+    
+    private func tryAudioEngineApproach() {
+        tryAudioEngineApproachInternal()
+    }
+    
+    private func resetCaptureSession() {
+        captureSession?.stopRunning()
+        captureSession = nil
+    }
+    
+    private func resetAudioEngine() {
+        if let input = audioEngine?.inputNode {
+            input.removeTap(onBus: 0)
+        }
+        mixerNode?.removeTap(onBus: 0)
+        audioEngine?.stop()
+        audioEngine?.reset()
+        audioEngine = nil
+        inputNode = nil
+        mixerNode = nil
+    }
+    
+    func stopMicrophone() {
+        guard isMicrophoneActive else { return }
+        
+        // Stop polling timer
+        stopPollingTimer()
+        
+        // Stop capture session if it's being used
+        resetCaptureSession()
+        
+        // Stop audio engine if it's being used
+        resetAudioEngine()
+        
+        DispatchQueue.main.async {
+            self.isMicrophoneActive = false
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                appDelegate.updateStatusIcon(isActive: false)
+            }
+        }
+    }
+    
+    func toggleMicrophone() {
+        if isMicrophoneActive {
+            stopMicrophone()
+            stopPollingTimer()
+        } else {
+            startMicrophone()
+            startPollingTimer()
+        }
+    }
+    
+    // MARK: - Polling and State Management
+    
+    private func startPollingTimer() {
+        stopPollingTimer() // Ensure no duplicate timers
+        
+        pollingTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+            self?.checkMicrophoneState()
+        }
+    }
+    
+    private func stopPollingTimer() {
+        pollingTimer?.invalidate()
+        pollingTimer = nil
+    }
+    
+    private func checkMicrophoneState() {
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            // Lost permission, update state
+            DispatchQueue.main.async {
+                if self.isMicrophoneActive {
+                    print("Lost microphone permission")
+                    self.isMicrophoneActive = false
+                    if let appDelegate = NSApp.delegate as? AppDelegate {
+                        appDelegate.updateStatusIcon(isActive: false)
+                    }
+                }
+            }
+            return
+        }
+        
+        // Refresh devices to detect changes
+        let oldDeviceCount = availableDevices.count
+        refreshDevices()
+        
+        if availableDevices.count != oldDeviceCount {
+            print("Device count changed: \(oldDeviceCount) -> \(availableDevices.count)")
+        }
+        
+        // Check if our preferred device is now available but we're using a fallback
+        if currentlyUsingFallback,
+           let preferredDevice = getPreferredDevice(),
+           selectedDevice?.uniqueID != preferredDevice.uniqueID {
+            print("🔄 Preferred device is available but we're using fallback. Switching back...")
+            DispatchQueue.main.async {
+                self.attemptReconnection()
+            }
+            return
+        }
+        
+        // Check if our selected device is still available
+        let selectedDeviceAvailable = selectedDevice == nil || availableDevices.contains { $0.uniqueID == selectedDevice?.uniqueID }
+        
+        let actuallyActive = isMicrophoneReallyActive()
+        let shouldBeActive = isMicrophoneActive
+        
+        print("State check - Should be active: \(shouldBeActive), Actually active: \(actuallyActive), Selected device available: \(selectedDeviceAvailable), Using fallback: \(currentlyUsingFallback)")
+        
+        DispatchQueue.main.async {
+            if shouldBeActive {
+                if !actuallyActive || !selectedDeviceAvailable {
+                    print("Microphone should be active but isn't working properly. Attempting reconnection...")
+                    // Force reconnection
+                    self.isMicrophoneActive = false
+                    self.attemptReconnection()
+                } else {
+                    // Everything looks good, but let's verify we have recent audio activity
+                    if let lastInput = self.lastAudioInputTime,
+                       Date().timeIntervalSince(lastInput) > 30 {
+                        print("No recent audio input detected, forcing reconnection")
+                        self.attemptReconnection()
+                    }
+                }
+            } else if actuallyActive {
+                // Microphone is running but UI shows inactive - sync state
+                print("Microphone is running but UI shows inactive - syncing state")
+                self.isMicrophoneActive = true
+                if let appDelegate = NSApp.delegate as? AppDelegate {
+                    appDelegate.updateStatusIcon(isActive: true)
+                }
+            }
+        }
+    }
+    
+    private func isMicrophoneReallyActive() -> Bool {
+        // Check if capture session is running and device is still connected
+        if let captureSession = captureSession {
+            let isRunning = captureSession.isRunning
+            
+            // Additional check: verify the device is still in our available devices
+            if let currentDevice = selectedDevice {
+                let deviceStillAvailable = availableDevices.contains { $0.uniqueID == currentDevice.uniqueID }
+                return isRunning && deviceStillAvailable
+            }
+            
+            return isRunning
+        }
+        
+        // Check if audio engine is running
+        if let audioEngine = audioEngine {
+            return audioEngine.isRunning
+        }
+        
+        return false
+    }
+    
+    private func attemptReconnection() {
+        print("Starting reconnection attempt...")
+        
+        // Clean up current state
+        resetCaptureSession()
+        resetAudioEngine()
+        
+        // Refresh available devices in case something changed
+        refreshDevices()
+        
+        print("Available devices after refresh: \(availableDevices.map { $0.localizedName })")
+        
+        // Try to find the best device to use based on preference priority
+        var deviceToUse: AVCaptureDevice?
+        
+        // HIGHEST PRIORITY: Preferred device if it's available
+        if let preferredDevice = getPreferredDevice() {
+            deviceToUse = preferredDevice
+            currentlyUsingFallback = false
+            print("✅ Using preferred device: \(deviceToUse?.localizedName ?? "unknown")")
+        }
+        // FALLBACK 1: Last successful device if it's still available
+        else if let lastDevice = lastSuccessfulDevice,
+           availableDevices.contains(where: { $0.uniqueID == lastDevice.uniqueID }) {
+            deviceToUse = availableDevices.first { $0.uniqueID == lastDevice.uniqueID }
+            currentlyUsingFallback = (deviceToUse?.uniqueID != preferredDeviceID)
+            print("📱 Using last successful device (fallback): \(deviceToUse?.localizedName ?? "unknown")")
+        }
+        // FALLBACK 2: Currently selected device if still available
+        else if let selectedDevice = selectedDevice,
+                availableDevices.contains(where: { $0.uniqueID == selectedDevice.uniqueID }) {
+            deviceToUse = availableDevices.first { $0.uniqueID == selectedDevice.uniqueID }
+            currentlyUsingFallback = (deviceToUse?.uniqueID != preferredDeviceID)
+            print("🔄 Using previously selected device (fallback): \(deviceToUse?.localizedName ?? "unknown")")
+        }
+        // FALLBACK 3: Any external/Bluetooth device
+        else if let externalDevice = availableDevices.first(where: { $0.deviceType == .externalUnknown }) {
+            deviceToUse = externalDevice
+            currentlyUsingFallback = true
+            print("🎧 Using any external device (fallback): \(deviceToUse?.localizedName ?? "unknown")")
+        }
+        // FALLBACK 4: Built-in microphone
+        else if let builtInDevice = availableDevices.first(where: { $0.deviceType == .builtInMicrophone }) {
+            deviceToUse = builtInDevice
+            currentlyUsingFallback = true
+            print("🖥️ Falling back to built-in microphone: \(deviceToUse?.localizedName ?? "unknown")")
+        }
+        
+        if let device = deviceToUse {
+            selectedDevice = device
+            
+            if currentlyUsingFallback {
+                print("⚠️ Using fallback device - will switch back to preferred device when available")
+            }
+            
+            startMicrophoneInternal()
+        } else {
+            print("❌ No audio devices available for reconnection")
+            currentlyUsingFallback = false
+            DispatchQueue.main.async {
+                self.isMicrophoneActive = false
+                if let appDelegate = NSApp.delegate as? AppDelegate {
+                    appDelegate.updateStatusIcon(isActive: false)
+                }
+            }
+        }
+    }
+    
+    private func startMicrophoneInternal() {
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            print("Cannot start microphone - permission not granted")
+            return
+        }
         
         // Use AVCaptureSession which allows sharing with other apps
         captureSession = AVCaptureSession()
@@ -243,20 +605,21 @@ class AppState: ObservableObject {
                 
                 DispatchQueue.main.async {
                     self?.isMicrophoneActive = true
+                    self?.lastSuccessfulDevice = device
                     if let appDelegate = NSApp.delegate as? AppDelegate {
                         appDelegate.updateStatusIcon(isActive: true)
                     }
-                    print("Microphone activated successfully (shared mode)")
+                    print("Microphone activated successfully: \(device.localizedName)")
                 }
             }
         } catch {
-            print("Failed to start microphone: \(error)")
+            print("Failed to start microphone with AVCaptureSession: \(error)")
             // Try the audio engine approach as fallback
-            tryAudioEngineApproach()
+            tryAudioEngineApproachInternal()
         }
     }
     
-    private func tryAudioEngineApproach() {
+    private func tryAudioEngineApproachInternal() {
         // Fallback to AVAudioEngine with minimal configuration
         resetCaptureSession()
         
@@ -266,64 +629,52 @@ class AppState: ObservableObject {
         let input = audioEngine.inputNode
         
         // Use the input's native format to avoid format mismatch
-        // Install tap with nil format to use the input node's format
-        input.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
-            // Empty - just keep the mic active
+        // Install tap with nil format to use the input node's format and monitor audio levels
+        input.installTap(onBus: 0, bufferSize: 256, format: nil) { [weak self] buffer, time in
+            // Monitor audio activity to detect if we're really getting input
+            self?.lastAudioInputTime = Date()
+            
+            // Check if there's actual audio data
+            let audioBufferList = buffer.audioBufferList
+            let audioBuffer = audioBufferList.pointee.mBuffers
+            
+            if let data = audioBuffer.mData {
+                let samples = data.bindMemory(to: Float.self, capacity: Int(audioBuffer.mDataByteSize) / MemoryLayout<Float>.size)
+                var hasSignal = false
+                
+                for i in 0..<Int(buffer.frameLength) {
+                    if abs(samples[i]) > 0.001 { // Very low threshold to detect any activity
+                        hasSignal = true
+                        break
+                    }
+                }
+                
+                DispatchQueue.main.async {
+                    self?.hasRecentAudioInput = hasSignal
+                }
+            }
         }
         
         do {
             try audioEngine.start()
             DispatchQueue.main.async {
                 self.isMicrophoneActive = true
+                if let device = self.selectedDevice {
+                    self.lastSuccessfulDevice = device
+                }
                 if let appDelegate = NSApp.delegate as? AppDelegate {
                     appDelegate.updateStatusIcon(isActive: true)
                 }
+                print("Microphone activated using AVAudioEngine")
             }
-            print("Microphone activated using AVAudioEngine (shared mode)")
         } catch {
             print("Failed to start audio engine: \(error)")
-        }
-    }
-    
-    private func resetCaptureSession() {
-        captureSession?.stopRunning()
-        captureSession = nil
-    }
-    
-    private func resetAudioEngine() {
-        if let input = audioEngine?.inputNode {
-            input.removeTap(onBus: 0)
-        }
-        mixerNode?.removeTap(onBus: 0)
-        audioEngine?.stop()
-        audioEngine?.reset()
-        audioEngine = nil
-        inputNode = nil
-        mixerNode = nil
-    }
-    
-    func stopMicrophone() {
-        guard isMicrophoneActive else { return }
-        
-        // Stop capture session if it's being used
-        resetCaptureSession()
-        
-        // Stop audio engine if it's being used
-        resetAudioEngine()
-        
-        DispatchQueue.main.async {
-            self.isMicrophoneActive = false
-            if let appDelegate = NSApp.delegate as? AppDelegate {
-                appDelegate.updateStatusIcon(isActive: false)
+            DispatchQueue.main.async {
+                self.isMicrophoneActive = false
+                if let appDelegate = NSApp.delegate as? AppDelegate {
+                    appDelegate.updateStatusIcon(isActive: false)
+                }
             }
-        }
-    }
-    
-    func toggleMicrophone() {
-        if isMicrophoneActive {
-            stopMicrophone()
-        } else {
-            startMicrophone()
         }
     }
 }
